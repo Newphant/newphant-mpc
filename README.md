@@ -30,3 +30,7 @@ python tools/generate_task_reference.py --help
 
 Run commands from the repository root; entry points add the root and `models/`
 to `sys.path` themselves.
+
+## License
+
+The code in this repository is released under the MIT License. See [LICENSE](LICENSE).
