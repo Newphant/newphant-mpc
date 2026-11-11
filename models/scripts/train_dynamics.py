@@ -1,0 +1,984 @@
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+DYNAMICS_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = DYNAMICS_ROOT.parent
+for root in (PROJECT_ROOT, DYNAMICS_ROOT):
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+import torch
+import numpy as np
+from torch import nn
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from tqdm import tqdm
+
+from neural_dynamics.dataset import (
+    load_npz_dataset, load_rollout_npz_dataset, split_dataset, split_dataset_by_group_ids,
+)
+from neural_dynamics.integration import reconstruct_next_state
+from neural_dynamics.normalization import StandardNormalizer
+from neural_dynamics.rollout import rollout_dynamics_batch
+from neural_dynamics.train_utils import (
+    build_model,
+    load_checkpoint,
+    require_resume_checkpoint,
+    save_checkpoint,
+    save_yaml,
+    set_seed,
+)
+from control.robot_config import file_sha256, load_robot_spec
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train learned MuJoCo dynamics.")
+    parser.add_argument("--data_path", required=True, type=str)
+    parser.add_argument("--robot_config", default="configs/robots/abb_irb2400.yaml")
+    parser.add_argument(
+        "--dataset_manifest",
+        default=None,
+        type=str,
+        help="Strict dataset manifest; defaults to data_path with .manifest.json suffix.",
+    )
+    parser.add_argument("--model_type", choices=["mlp", "gru", "transformer"], default="transformer", type=str)
+    parser.add_argument("--history_len", default=1, type=int)
+    parser.add_argument("--batch_size", default=1024, type=int)
+    parser.add_argument(
+        "--micro_batch_size", default=None, type=int,
+        help="Training-only micro-batch size. Gradients are summed and the optimizer steps once per --batch_size.",
+    )
+    parser.add_argument("--epochs", default=100, type=int)
+    parser.add_argument("--lr", default=1e-3, type=float)
+    parser.add_argument("--save_dir", default="outputs/checkpoints", type=str)
+    parser.add_argument("--seed", default=10, type=int)
+    parser.add_argument("--num_workers", default=0, type=int)
+    parser.add_argument("--pin_memory", action="store_true")
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--resume_checkpoint", default=None, type=str)
+    parser.add_argument("--init_from_checkpoint", default=None, type=str)
+    parser.add_argument("--normalizer_path", default=None, type=str)
+    parser.add_argument("--freeze_normalizer", action="store_true")
+    parser.add_argument("--source_weights", default=None, type=str, help="Comma-separated source_id:weight pairs, e.g. 0:0.5,1:0.5.")
+    parser.add_argument("--steps_per_epoch", default=None, type=int)
+    parser.add_argument("--q_weight", default=1.0, type=float)
+    parser.add_argument("--dq_weight", default=1.0, type=float)
+    parser.add_argument("--q_extra_weights", default=None, type=str)
+    parser.add_argument("--dq_extra_weights", default=None, type=str)
+    parser.add_argument("--target_mode", choices=["delta_state", "delta_dq"], default="delta_dq", type=str)
+    parser.add_argument(
+        "--action_input_mode", choices=["absolute_q_ref", "q_ref_minus_q"], required=True,
+        help="Required model input semantics: [q,dq,u] or [q,dq,u-q].",
+    )
+    parser.add_argument("--control_dt", default=0.01, type=float)
+    parser.add_argument("--loss_type", choices=["mse", "huber"], default="mse", type=str)
+    parser.add_argument("--huber_delta", default=1.0, type=float)
+    parser.add_argument("--rollout_loss_steps", default=1, type=int)
+    parser.add_argument("--rollout_loss_weight", default=0.0, type=float)
+    parser.add_argument("--rollout_loss_discount", default=1.0, type=float)
+    parser.add_argument("--real_defaults", action="store_true", help="Use frozen SO101 Model-A defaults (GRU/16-step/delta-state/Huber/30 Hz).")
+    parser.add_argument("--test_group_ids", default=None, help="Comma-separated split_group_ids held out from both training and validation.")
+    parser.add_argument("--validation_group_ids", default=None,
+                        help="Comma-separated split_group_ids used only for validation (required for real data).")
+    parser.add_argument("--val_fraction", default=0.1, type=float)
+    parser.add_argument("--train_sample_stride", default=1, type=int)
+    parser.add_argument("--val_sample_stride", default=1, type=int)
+    parser.add_argument(
+        "--no_require_q_ref_dataset",
+        action="store_true",
+        help="Allow legacy datasets without q_ref diagnostics. Not recommended for current position-control data.",
+    )
+    return parser.parse_args()
+
+
+def validate_checkpoint_config(checkpoint: dict, expected: dict, expected_state_dict: dict[str, torch.Tensor] | None = None) -> None:
+    config = checkpoint.get("config", {})
+    if not isinstance(config, dict):
+        raise ValueError("Checkpoint config must be a mapping")
+    for key in ("model_type", "history_len", "state_dim", "action_dim", "output_dim", "target_mode", "control_dt", "action_input_mode"):
+        actual = config.get(key, "absolute_q_ref" if key == "action_input_mode" else None)
+        if key not in config and key != "action_input_mode":
+            raise ValueError(f"Checkpoint config is missing required compatibility field {key!r}")
+        if actual != expected[key]:
+            raise ValueError(
+                f"Checkpoint {key}={actual!r} does not match current {key}={expected[key]!r}"
+            )
+    if expected.get("plant_identity") is not None and config.get("plant_identity") != expected["plant_identity"]:
+        raise ValueError("Checkpoint plant_identity does not match current real plant")
+    if expected_state_dict is not None:
+        actual_state_dict = checkpoint.get("model_state_dict")
+        if not isinstance(actual_state_dict, dict):
+            raise ValueError("Checkpoint is missing model_state_dict")
+        expected_shapes = {name: tuple(value.shape) for name, value in expected_state_dict.items()}
+        actual_shapes = {name: tuple(value.shape) for name, value in actual_state_dict.items()}
+        if expected_shapes != actual_shapes:
+            raise ValueError("Checkpoint model structure/state-dict shapes do not match the current architecture")
+
+
+def checkpoint_metadata(
+    checkpoint_type: str,
+    epoch: int,
+    train_loss: float,
+    val_loss: float,
+    best_val: float,
+    args: argparse.Namespace,
+    best_rollout: float | None = None,
+) -> dict:
+    return {
+        "checkpoint_type": checkpoint_type,
+        "epoch": epoch,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "best_val": best_val,
+        "best_rollout": best_rollout,
+        "init_from_checkpoint": args.init_from_checkpoint,
+        "resume_checkpoint": args.resume_checkpoint,
+    }
+
+
+def normalize_batch(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    normalizer: StandardNormalizer,
+    state_dim: int,
+    model_type: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if model_type == "mlp":
+        x_norm = normalizer.normalize_single_input(x[:, :state_dim], x[:, state_dim:])
+    else:
+        x_norm = normalizer.normalize_sequence_input(x, state_dim)
+    y_norm = normalizer.normalize_delta(y)
+    return x_norm, y_norm
+
+
+def parse_extra_weights(value: str | None, n_joints: int, name: str) -> torch.Tensor | None:
+    if value is None:
+        return None
+    weights = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if len(weights) != n_joints:
+        raise ValueError(f"Expected {n_joints} values for {name}, got {len(weights)}: {value!r}")
+    if any(weight < 0 for weight in weights):
+        raise ValueError(f"{name} values must be non-negative, got {value!r}")
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def parse_source_weights(value: str | None) -> dict[int, float] | None:
+    if value is None:
+        return None
+    result: dict[int, float] = {}
+    for item in value.split(","):
+        source, separator, weight = item.strip().partition(":")
+        if not separator:
+            raise ValueError("--source_weights must use source_id:weight pairs")
+        source_id, parsed_weight = int(source), float(weight)
+        if source_id < 0 or parsed_weight <= 0 or not np.isfinite(parsed_weight):
+            raise ValueError("source IDs must be non-negative and source weights finite positive values")
+        if source_id in result:
+            raise ValueError(f"Duplicate source ID in --source_weights: {source_id}")
+        result[source_id] = parsed_weight
+    total = sum(result.values())
+    return {source: weight / total for source, weight in result.items()}
+
+
+def build_source_sampler(
+    dataset: DynamicsDataset,
+    subset,
+    source_weights: dict[int, float] | None,
+    steps_per_epoch: int | None,
+    batch_size: int,
+) -> tuple[WeightedRandomSampler | None, dict[str, object]]:
+    if source_weights is None:
+        return None, {}
+    if dataset.source_ids is None or dataset.sequence_indices is None:
+        raise ValueError("--source_weights requires source_ids and sequence-aware dataset windows")
+    indices = np.asarray(subset.indices, dtype=np.int64)
+    starts = dataset.sequence_indices[indices]
+    current = starts if dataset.model_type == "mlp" else starts + dataset.history_len - 1
+    sources = dataset.source_ids.cpu().numpy()[current]
+    counts = {int(source): int(np.sum(sources == source)) for source in np.unique(sources)}
+    missing = set(source_weights).difference(counts)
+    if missing:
+        raise ValueError(f"Requested source IDs have no training windows: {sorted(missing)}")
+    sample_weights = np.empty(len(sources), dtype=np.float64)
+    for source_id, count in counts.items():
+        target = source_weights.get(source_id, 0.0)
+        sample_weights[sources == source_id] = 0.0 if target == 0.0 else target / count
+    total_samples = (
+        int(steps_per_epoch) * int(batch_size)
+        if steps_per_epoch is not None
+        else max(int(np.ceil(counts[source] / source_weights[source])) for source in source_weights)
+    )
+    if total_samples <= 0:
+        raise ValueError("--steps_per_epoch must be positive")
+    return WeightedRandomSampler(torch.as_tensor(sample_weights, dtype=torch.double), total_samples, replacement=True), {
+        "source_weights": source_weights,
+        "source_window_counts": counts,
+        "samples_per_epoch": total_samples,
+        "batches_per_epoch": int(np.ceil(total_samples / batch_size)),
+        "source_resampling_factor": {str(source): float(total_samples * source_weights[source] / counts[source]) for source in source_weights},
+    }
+
+
+def source_window_subsets(dataset: DynamicsDataset, subset) -> tuple[dict[int, np.ndarray], dict[int, int]]:
+    """Partition sequence windows by the source of their current target."""
+    if dataset.source_ids is None or dataset.sequence_indices is None:
+        return {}, {}
+    indices = np.asarray(subset.indices, dtype=np.int64)
+    starts = dataset.sequence_indices[indices]
+    current = starts if dataset.model_type == "mlp" else starts + dataset.history_len - 1
+    sources = dataset.source_ids.cpu().numpy()[current]
+    partitions = {int(source): indices[sources == source] for source in np.unique(sources)}
+    return partitions, {source: int(len(values)) for source, values in partitions.items()}
+
+
+def validate_q_ref_dataset(data_path: Path, model_type: str) -> None:
+    data = np.load(data_path)
+    required = {"states", "actions", "next_states", "q_ref", "delta_q_ref"}
+    missing = required.difference(data.files)
+    if missing:
+        raise KeyError(
+            f"Dataset {data_path} is missing q_ref position-control arrays: {sorted(missing)}. "
+            "Use a dataset collected with the current closed-loop q_ref collector, or pass "
+            "--no_require_q_ref_dataset only for legacy experiments."
+        )
+    if data["actions"].shape != data["q_ref"].shape or not np.allclose(data["actions"], data["q_ref"], atol=1e-6):
+        raise ValueError("Current position-control training expects actions == q_ref for every sample.")
+    if model_type != "mlp" and "episode_ids" not in data.files:
+        raise KeyError("Sequence models require episode_ids so history windows do not cross reset boundaries.")
+
+
+def write_artifact_manifest(
+    save_dir: Path,
+    *,
+    robot_identity: dict,
+    dataset_manifest_path: Path,
+    dataset_manifest_sha256: str,
+    plant_identity: dict | None = None,
+) -> None:
+    files = {}
+    for name in (
+        "normalizer.pt",
+        "best_model.pt",
+        "best_rollout_model.pt",
+        "latest_model.pt",
+        "config.yaml",
+    ):
+        path = save_dir / name
+        if path.is_file():
+            files[name] = {"path": name, "sha256": file_sha256(path)}
+    payload = {
+        "schema_version": 1,
+        "kind": "robot_dynamics_training_artifacts",
+        "robot_identity": robot_identity,
+        "plant_identity": plant_identity,
+        "dataset_manifest": {
+            "path": str(dataset_manifest_path),
+            "sha256": dataset_manifest_sha256,
+        },
+        "files": files,
+    }
+    (save_dir / "artifact_manifest.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def weighted_delta_loss(
+    pred_norm: torch.Tensor,
+    target_norm: torch.Tensor,
+    n_joints: int,
+    q_weight: float,
+    dq_weight: float,
+    q_extra_weights: torch.Tensor | None,
+    dq_extra_weights: torch.Tensor | None,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
+) -> torch.Tensor:
+    if pred_norm.shape != target_norm.shape:
+        raise ValueError(f"pred_norm and target_norm must have same shape, got {pred_norm.shape} and {target_norm.shape}")
+    if pred_norm.ndim != 2:
+        raise ValueError(f"pred_norm and target_norm must be rank-2 tensors, got ndim={pred_norm.ndim}")
+    if loss_type not in {"mse", "huber"}:
+        raise ValueError(f"loss_type must be 'mse' or 'huber', got {loss_type!r}")
+    if pred_norm.shape[1] not in {n_joints, 2 * n_joints}:
+        raise ValueError(f"Expected target dimension {n_joints} or {2 * n_joints}, got {pred_norm.shape[1]}")
+
+    def elementwise_loss(error: torch.Tensor) -> torch.Tensor:
+        if loss_type == "mse":
+            return torch.square(error)
+        abs_error = torch.abs(error)
+        quadratic = torch.minimum(abs_error, torch.as_tensor(huber_delta, device=error.device, dtype=error.dtype))
+        linear = abs_error - quadratic
+        return 0.5 * torch.square(quadratic) + huber_delta * linear
+
+    if pred_norm.shape[1] == n_joints:
+        dq_error = elementwise_loss(pred_norm - target_norm)
+        if dq_extra_weights is not None:
+            dq_error = dq_error * dq_extra_weights.to(device=pred_norm.device, dtype=pred_norm.dtype)
+        return dq_weight * torch.sum(dq_error)
+
+    q_error = elementwise_loss(pred_norm[:, :n_joints] - target_norm[:, :n_joints])
+    dq_error = elementwise_loss(pred_norm[:, n_joints:] - target_norm[:, n_joints:])
+    if q_extra_weights is not None:
+        q_error = q_error * q_extra_weights.to(device=pred_norm.device, dtype=pred_norm.dtype)
+    if dq_extra_weights is not None:
+        dq_error = dq_error * dq_extra_weights.to(device=pred_norm.device, dtype=pred_norm.dtype)
+    q_loss = torch.sum(q_error)
+    dq_loss = torch.sum(dq_error)
+    return q_weight * q_loss + dq_weight * dq_loss
+
+
+def rollout_state_loss(
+    pred_states: torch.Tensor,
+    true_states: torch.Tensor,
+    normalizer: StandardNormalizer,
+    discount: float = 1.0,
+) -> torch.Tensor:
+    if pred_states.shape != true_states.shape:
+        raise ValueError(f"pred_states and true_states must have same shape, got {pred_states.shape} and {true_states.shape}")
+    if pred_states.ndim != 3:
+        raise ValueError(f"pred_states and true_states must be rank-3 tensors, got ndim={pred_states.ndim}")
+    if discount <= 0:
+        raise ValueError(f"discount must be positive, got {discount}")
+    pred_norm = normalizer.normalize_state(pred_states)
+    true_norm = normalizer.normalize_state(true_states)
+    step_error = torch.sum(torch.square(pred_norm - true_norm), dim=-1)
+    weights = torch.pow(
+        torch.as_tensor(discount, device=pred_states.device, dtype=pred_states.dtype),
+        torch.arange(pred_states.shape[1], device=pred_states.device, dtype=pred_states.dtype),
+    )
+    return torch.sum(step_error * weights.unsqueeze(0))
+
+
+def predict_rollout_states(
+    model: nn.Module,
+    normalizer: StandardNormalizer,
+    model_type: str,
+    initial_input: torch.Tensor,
+    rollout_actions: torch.Tensor,
+    state_dim: int,
+    target_mode: str,
+    control_dt: float,
+    track_grad: bool = False,
+) -> torch.Tensor:
+    if rollout_actions.ndim != 3:
+        raise ValueError(f"rollout_actions must have shape [batch, steps, action_dim], got {rollout_actions.shape}")
+    initial_history = initial_input.unsqueeze(1) if model_type == "mlp" and initial_input.ndim == 2 else initial_input
+    pred_states = rollout_dynamics_batch(
+        model=model,
+        normalizer=normalizer,
+        model_type=model_type,
+        initial_history=initial_history,
+        future_q_ref=rollout_actions,
+        state_dim=state_dim,
+        target_mode=target_mode,
+        control_dt=control_dt,
+        track_grad=track_grad,
+    )
+    return pred_states[:, 1:]
+
+
+def format_epoch_header(epoch: int, train_loss: float, val_loss: float, is_best: bool) -> str:
+    best_marker = "  ★ best" if is_best else ""
+    return f"\n[Epoch {epoch:04d}]  train_loss={train_loss:.6f}  val_loss={val_loss:.6f}{best_marker}"
+
+
+def format_delta_rmse_table(train_rmse: torch.Tensor, val_rmse: torch.Tensor, n_joints: int) -> str:
+    t = train_rmse.detach().cpu().tolist()
+    v = val_rmse.detach().cpu().tolist()
+    lines = [
+        f"{'Joint':>5} | {'train_q':>10} {'train_dq':>10} | {'val_q':>10} {'val_dq':>10}",
+        f"{'-' * 5}-+-{'-' * 10}-{'-' * 10}-+-{'-' * 10}-{'-' * 10}",
+    ]
+    for i in range(n_joints):
+        lines.append(
+            f"{i:>5} | {t[i]:>10.6f} {t[n_joints + i]:>10.6f} | {v[i]:>10.6f} {v[n_joints + i]:>10.6f}"
+        )
+    return "\n".join(lines)
+
+
+def format_delta_rmse(name: str, rmse: torch.Tensor, n_joints: int) -> str:
+    values = rmse.detach().cpu().tolist()
+    labels = [f"q{i}" for i in range(n_joints)] + [f"dq{i}" for i in range(n_joints)]
+    parts = [f"{name}_{label}_rmse={value:.6f}" for label, value in zip(labels, values)]
+    return " ".join(parts)
+
+
+def fit_normalizer_with_progress(
+    normalizer: StandardNormalizer,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    deltas: torch.Tensor,
+) -> None:
+    with tqdm(total=6, desc="fit normalizer", unit="stat") as progress:
+        normalizer.state_mean = states.mean(dim=0)
+        progress.update()
+        normalizer.state_std = states.std(dim=0, unbiased=False).clamp_min(normalizer.eps)
+        progress.update()
+        encoded_actions = normalizer.encode_action(states, actions)
+        normalizer.action_mean = encoded_actions.mean(dim=0)
+        progress.update()
+        normalizer.action_std = encoded_actions.std(dim=0, unbiased=False).clamp_min(normalizer.eps)
+        progress.update()
+        normalizer.delta_mean = deltas.mean(dim=0)
+        progress.update()
+        normalizer.delta_std = deltas.std(dim=0, unbiased=False).clamp_min(normalizer.eps)
+        progress.update()
+
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    normalizer: StandardNormalizer,
+    state_dim: int,
+    model_type: str,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None = None,
+    scaler: torch.amp.GradScaler | None = None,
+    use_amp: bool = False,
+    q_weight: float = 1.0,
+    dq_weight: float = 1.0,
+    q_extra_weights: torch.Tensor | None = None,
+    dq_extra_weights: torch.Tensor | None = None,
+    target_mode: str = "delta_dq",
+    control_dt: float = 0.01,
+    loss_type: str = "mse",
+    huber_delta: float = 1.0,
+    rollout_loss_weight: float = 0.0,
+    rollout_loss_discount: float = 1.0,
+    micro_batch_size: int | None = None,
+) -> tuple[float, torch.Tensor, float]:
+    training = optimizer is not None
+    model.train(training)
+    total_loss = 0.0
+    total_rollout_loss = 0.0
+    total_samples = 0
+    squared_error_sum = torch.zeros(state_dim, dtype=torch.float64)
+    progress = tqdm(loader, desc="train" if training else "val", leave=False)
+    for batch in progress:
+        if len(batch) == 2:
+            x, y = batch
+            rollout_actions = None
+            rollout_next_states = None
+        elif len(batch) == 4:
+            x, y, rollout_actions, rollout_next_states = batch
+        else:
+            raise ValueError(f"Expected batch with 2 or 4 tensors, got {len(batch)}")
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+        effective_batch_size = int(y.shape[0])
+        chunk_size = effective_batch_size
+        if training and micro_batch_size is not None:
+            chunk_size = min(int(micro_batch_size), effective_batch_size)
+        for start in range(0, effective_batch_size, chunk_size):
+            end = min(start + chunk_size, effective_batch_size)
+            x_micro = x[start:end].to(device, non_blocking=True)
+            y_micro = y[start:end].to(device, non_blocking=True)
+            rollout_actions_micro = (
+                None if rollout_actions is None else rollout_actions[start:end].to(device, non_blocking=True)
+            )
+            rollout_next_states_micro = (
+                None if rollout_next_states is None else rollout_next_states[start:end].to(device, non_blocking=True)
+            )
+            x_norm, y_norm = normalize_batch(x_micro, y_micro, normalizer, state_dim, model_type)
+            with torch.set_grad_enabled(training):
+                with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                    pred = model(x_norm)
+                    one_step_loss = weighted_delta_loss(
+                        pred, y_norm, state_dim // 2, q_weight, dq_weight,
+                        q_extra_weights, dq_extra_weights, loss_type, huber_delta,
+                    )
+                    rollout_loss_value = torch.zeros((), dtype=one_step_loss.dtype, device=one_step_loss.device)
+                    if (
+                        rollout_loss_weight > 0.0
+                        and rollout_actions_micro is not None
+                        and rollout_next_states_micro is not None
+                        and rollout_actions_micro.shape[1] > 1
+                    ):
+                        rollout_pred_states = predict_rollout_states(
+                            model, normalizer, model_type, x_micro, rollout_actions_micro,
+                            state_dim, target_mode, control_dt, track_grad=training,
+                        )
+                        rollout_loss_value = rollout_state_loss(
+                            rollout_pred_states, rollout_next_states_micro, normalizer,
+                            rollout_loss_discount,
+                        )
+                    loss = one_step_loss + rollout_loss_weight * rollout_loss_value
+                if training:
+                    if scaler is not None and use_amp:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
+            pred_target = normalizer.denormalize_delta(pred.detach())
+            current_state = x_micro[:, :state_dim] if model_type == "mlp" else x_micro[:, -1, :state_dim]
+            pred_next = reconstruct_next_state(current_state, pred_target, target_mode, control_dt, state_dim // 2)
+            if target_mode == "delta_state":
+                true_next = current_state + y_micro
+            else:
+                true_next = reconstruct_next_state(current_state, y_micro, target_mode, control_dt, state_dim // 2)
+            squared_error_sum += torch.square(pred_next - true_next).sum(dim=0).detach().cpu().double()
+            total_loss += float(loss.detach().cpu())
+            total_rollout_loss += float(rollout_loss_value.detach().cpu())
+            total_samples += int(y_micro.shape[0])
+        if training:
+            if scaler is not None and use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+        progress.set_postfix(loss=total_loss / max(total_samples, 1))
+    rmse = torch.sqrt(squared_error_sum / max(total_samples, 1)).float()
+    return total_loss / max(total_samples, 1), rmse, total_rollout_loss / max(total_samples, 1)
+
+
+def main() -> None:
+    args = parse_args()
+    if args.real_defaults:
+        args.model_type = "gru"
+        args.history_len = 16
+        args.target_mode = "delta_state"
+        args.control_dt = 1.0 / 30.0
+        args.loss_type = "huber"
+        args.q_weight = 1.0
+        args.dq_weight = 0.35
+        args.rollout_loss_steps = 5
+        if args.rollout_loss_weight == 0.0:
+            args.rollout_loss_weight = 1.0
+        if args.val_fraction == 0.1:
+            args.val_fraction = 0.2
+    robot = load_robot_spec(args.robot_config, validate_model=True)
+    data_path = Path(args.data_path).expanduser().resolve()
+    manifest_path = (
+        data_path.with_suffix(".manifest.json")
+        if args.dataset_manifest is None
+        else Path(args.dataset_manifest).expanduser().resolve()
+    )
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Strict robot training requires dataset manifest: {manifest_path}")
+    dataset_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if dataset_manifest.get("robot_identity") != robot.artifact_identity():
+        raise ValueError("Dataset manifest robot identity does not match --robot_config")
+    plant_identity = dataset_manifest.get("plant_identity")
+    if robot.source.get("domain") == "real":
+        if not isinstance(plant_identity, dict):
+            raise ValueError("Real-domain training requires plant_identity in the dataset manifest")
+        if dataset_manifest.get("collection_mode") != "model_a_excitation":
+            raise ValueError("SO101 Model A training accepts only model_a_excitation data")
+    dataset_record = dataset_manifest.get("dataset", {})
+    if dataset_record.get("sha256") != file_sha256(data_path):
+        raise ValueError("Dataset file hash does not match its manifest")
+    dataset_manifest_sha256 = file_sha256(manifest_path)
+    if not np.isclose(args.control_dt, robot.expected_control_dt, atol=1e-12, rtol=0.0):
+        raise ValueError("--control_dt must match RobotSpec expected_control_dt")
+    if args.resume_checkpoint and args.init_from_checkpoint:
+        raise ValueError("--resume_checkpoint and --init_from_checkpoint cannot be used together")
+    if args.freeze_normalizer and not args.normalizer_path:
+        raise ValueError("--freeze_normalizer requires --normalizer_path")
+    if args.model_type == "mlp":
+        args.history_len = 1
+    if args.history_len <= 0:
+        raise ValueError(f"history_len must be positive, got {args.history_len}")
+    if args.epochs <= 0:
+        raise ValueError(f"epochs must be positive, got {args.epochs}")
+    if args.control_dt <= 0:
+        raise ValueError(f"control_dt must be positive, got {args.control_dt}")
+    if args.huber_delta <= 0:
+        raise ValueError(f"huber_delta must be positive, got {args.huber_delta}")
+    if args.rollout_loss_steps <= 0:
+        raise ValueError(f"rollout_loss_steps must be positive, got {args.rollout_loss_steps}")
+    if args.rollout_loss_weight < 0:
+        raise ValueError(f"rollout_loss_weight must be non-negative, got {args.rollout_loss_weight}")
+    if args.rollout_loss_discount <= 0:
+        raise ValueError(f"rollout_loss_discount must be positive, got {args.rollout_loss_discount}")
+    if args.batch_size <= 0:
+        raise ValueError("--batch_size must be positive")
+    if args.micro_batch_size is not None:
+        if args.micro_batch_size <= 0:
+            raise ValueError("--micro_batch_size must be positive")
+        if args.micro_batch_size > args.batch_size:
+            raise ValueError("--micro_batch_size cannot exceed --batch_size")
+    if args.train_sample_stride <= 0:
+        raise ValueError(f"train_sample_stride must be positive, got {args.train_sample_stride}")
+    if args.steps_per_epoch is not None and args.steps_per_epoch <= 0:
+        raise ValueError("--steps_per_epoch must be positive when provided")
+    if args.val_sample_stride <= 0:
+        raise ValueError(f"val_sample_stride must be positive, got {args.val_sample_stride}")
+    if args.q_weight < 0 or args.dq_weight < 0:
+        raise ValueError(f"q_weight and dq_weight must be non-negative, got {args.q_weight}, {args.dq_weight}")
+    if args.q_weight == 0 and args.dq_weight == 0:
+        raise ValueError("At least one of q_weight or dq_weight must be positive")
+    use_rollout_loss = bool(args.rollout_loss_steps > 1 and args.rollout_loss_weight > 0.0)
+    def parse_group_ids(value: str | None, option: str) -> np.ndarray | None:
+        if value is None:
+            return None
+        parsed = np.asarray([int(item) for item in value.split(",") if item.strip()], dtype=np.int64)
+        if parsed.size != len(np.unique(parsed)):
+            raise ValueError(f"{option} must not contain duplicate group IDs")
+        return parsed
+
+    test_group_ids = parse_group_ids(args.test_group_ids, "--test_group_ids")
+    validation_group_ids = parse_group_ids(args.validation_group_ids, "--validation_group_ids")
+    if robot.source.get("domain") == "real":
+        # The real Model-A corpus is one split_group_id per session.  Unlike the
+        # earlier fixed 12-session E3 plan (8 train / 2 validation / 2 test), the
+        # 48-session plan allows the operator to hold out any subset of sessions
+        # for validation and test.  Validation and test groups must be explicit,
+        # disjoint, and present in the dataset; every other group trains.
+        if test_group_ids is None or test_group_ids.size < 1:
+            raise ValueError("Real Model-A training requires at least one --test_group_ids")
+        if validation_group_ids is None or validation_group_ids.size < 1:
+            raise ValueError("Real Model-A training requires at least one --validation_group_ids")
+        if np.intersect1d(test_group_ids, validation_group_ids).size:
+            raise ValueError("test and validation group IDs must be disjoint")
+        with np.load(data_path, allow_pickle=False) as raw_dataset:
+            if "split_group_ids" not in raw_dataset.files:
+                raise KeyError("Real Model-A training requires split_group_ids")
+            all_group_ids = np.unique(np.asarray(raw_dataset["split_group_ids"], dtype=np.int64))
+        selected = np.union1d(test_group_ids, validation_group_ids)
+        missing = np.setdiff1d(selected, all_group_ids)
+        if missing.size:
+            raise ValueError(f"requested split groups are absent from dataset: {missing.tolist()}")
+        if np.setdiff1d(all_group_ids, selected).size == 0:
+            raise ValueError("at least one split_group_id must remain for training")
+    if not args.no_require_q_ref_dataset:
+        validate_q_ref_dataset(data_path, args.model_type)
+
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"using device: {device}", flush=True)
+    if use_rollout_loss:
+        dataset = load_rollout_npz_dataset(
+            data_path,
+            args.model_type,
+            args.history_len,
+            target_mode=args.target_mode,
+            rollout_steps=args.rollout_loss_steps,
+            exclude_split_group_ids=test_group_ids,
+        )
+    else:
+        dataset = load_npz_dataset(data_path, args.model_type, args.history_len, target_mode=args.target_mode,
+                                   exclude_split_group_ids=test_group_ids)
+    q_extra_weights = parse_extra_weights(args.q_extra_weights, dataset.state_dim // 2, "q_extra_weights")
+    dq_extra_weights = parse_extra_weights(args.dq_extra_weights, dataset.state_dim // 2, "dq_extra_weights")
+    source_weights = parse_source_weights(args.source_weights)
+    print(
+        f"loaded dataset: samples={len(dataset)} state_dim={dataset.state_dim} "
+        f"action_dim={dataset.action_dim} history_len={args.history_len}",
+        flush=True,
+    )
+    if q_extra_weights is not None:
+        print(f"q_extra_weights={q_extra_weights.tolist()}", flush=True)
+    if dq_extra_weights is not None:
+        print(f"dq_extra_weights={dq_extra_weights.tolist()}", flush=True)
+    if validation_group_ids is not None:
+        train_set, val_set = split_dataset_by_group_ids(
+            dataset, validation_group_ids,
+            train_sample_stride=args.train_sample_stride,
+            val_sample_stride=args.val_sample_stride,
+        )
+    else:
+        train_set, val_set = split_dataset(
+            dataset,
+            val_fraction=args.val_fraction,
+            seed=args.seed,
+            train_sample_stride=args.train_sample_stride,
+            val_sample_stride=args.val_sample_stride,
+            show_progress=True,
+        )
+    print(
+        f"split dataset: train={len(train_set)} val={len(val_set)} "
+        f"train_sample_stride={args.train_sample_stride} val_sample_stride={args.val_sample_stride}",
+        flush=True,
+    )
+
+    normalizer_source: Path | None = None
+    if args.freeze_normalizer:
+        normalizer_source = Path(args.normalizer_path).expanduser().resolve()
+        normalizer = StandardNormalizer.load(normalizer_source)
+        if normalizer.action_input_mode != args.action_input_mode:
+            raise ValueError(
+                "Frozen normalizer action_input_mode does not match training: "
+                f"{normalizer.action_input_mode!r} != {args.action_input_mode!r}"
+            )
+        if normalizer.metadata.get("robot_identity") != robot.artifact_identity():
+            raise ValueError("Frozen normalizer robot identity does not match RobotSpec")
+        if normalizer.metadata.get("dataset_manifest_sha256") != dataset_manifest_sha256:
+            raise ValueError("Frozen normalizer dataset identity does not match current training data")
+        if normalizer.metadata.get("plant_identity") != plant_identity:
+            raise ValueError("Frozen normalizer plant identity does not match current real plant")
+        print(f"loaded frozen normalizer: {normalizer_source}", flush=True)
+    else:
+        print("fitting normalizer", flush=True)
+        # Fit only the train windows.  Validation and test session statistics
+        # must not leak into the real-world normalizer.
+        train_window_indices = np.asarray(train_set.indices, dtype=np.int64)
+        if dataset.model_type == "mlp":
+            train_rows = train_window_indices
+        else:
+            if dataset.sequence_indices is None:
+                raise RuntimeError("sequence dataset has no sequence indices")
+            train_rows = dataset.sequence_indices[train_window_indices] + dataset.history_len - 1
+        train_states = dataset.states[train_rows]
+        train_actions = dataset.actions[train_rows]
+        deltas = dataset.next_states[train_rows] - train_states
+        if args.target_mode == "delta_dq":
+            deltas = deltas[:, dataset.state_dim // 2 :]
+        normalizer = StandardNormalizer(action_input_mode=args.action_input_mode)
+        fit_normalizer_with_progress(normalizer, train_states, train_actions, deltas)
+        del deltas, train_states, train_actions
+        print("normalizer ready", flush=True)
+    normalizer.metadata = {
+        "schema_version": 2,
+        "action_input_mode": args.action_input_mode,
+        "robot_identity": robot.artifact_identity(),
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "plant_identity": plant_identity,
+    }
+
+    model = build_model(
+        args.model_type,
+        dataset.state_dim,
+        dataset.action_dim,
+        args.history_len,
+        output_dim=dataset.target_dim,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    use_amp = bool(args.amp and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    config = {
+        "model_type": args.model_type,
+        "state_dim": dataset.state_dim,
+        "action_dim": dataset.action_dim,
+        "output_dim": dataset.target_dim,
+        "history_len": args.history_len,
+        "target_mode": args.target_mode,
+        "action_input_mode": args.action_input_mode,
+        "control_dt": args.control_dt,
+        "batch_size": args.batch_size,
+        "micro_batch_size": args.micro_batch_size,
+        "gradient_accumulation_steps": (
+            1 if args.micro_batch_size is None else int(np.ceil(args.batch_size / args.micro_batch_size))
+        ),
+        "epochs": args.epochs,
+        "amp": bool(args.amp),
+        "pin_memory": bool(args.pin_memory),
+        "num_workers": args.num_workers,
+        "lr": args.lr,
+        "seed": args.seed,
+        "q_weight": args.q_weight,
+        "dq_weight": args.dq_weight,
+        "q_extra_weights": None if q_extra_weights is None else q_extra_weights.tolist(),
+        "dq_extra_weights": None if dq_extra_weights is None else dq_extra_weights.tolist(),
+        "loss_type": args.loss_type,
+        "huber_delta": args.huber_delta,
+        "rollout_loss_steps": args.rollout_loss_steps,
+        "rollout_loss_weight": args.rollout_loss_weight,
+        "rollout_loss_discount": args.rollout_loss_discount,
+        "train_sample_stride": args.train_sample_stride,
+        "val_sample_stride": args.val_sample_stride,
+        "normalizer_path": None if normalizer_source is None else str(normalizer_source),
+        "freeze_normalizer": bool(args.freeze_normalizer),
+        "source_weights": source_weights,
+        "steps_per_epoch": args.steps_per_epoch,
+        "test_group_ids": None if test_group_ids is None else test_group_ids.tolist(),
+        "validation_group_ids": None if validation_group_ids is None else validation_group_ids.tolist(),
+        "val_fraction": args.val_fraction,
+        "robot_identity": robot.artifact_identity(),
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "dataset_sha256": dataset_record["sha256"],
+        "plant_identity": plant_identity,
+    }
+
+    start_epoch = 1
+    best_val = float("inf")
+    best_rollout = float("inf")
+
+    if args.resume_checkpoint:
+        checkpoint = require_resume_checkpoint(load_checkpoint(Path(args.resume_checkpoint), map_location=device))
+        validate_checkpoint_config(checkpoint, config, model.state_dict())
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        metadata = checkpoint["metadata"]
+        start_epoch = int(metadata["epoch"]) + 1
+        best_val = float(metadata["best_val"])
+        best_rollout = float(metadata.get("best_rollout", float("inf")))
+        save_dir = Path(args.resume_checkpoint).expanduser().resolve().parent
+    else:
+        if args.init_from_checkpoint:
+            checkpoint = load_checkpoint(Path(args.init_from_checkpoint), map_location=device)
+            validate_checkpoint_config(checkpoint, config, model.state_dict())
+            model.load_state_dict(checkpoint["model_state_dict"])
+        run_name = f"{args.model_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        save_dir = Path(args.save_dir) / run_name
+
+    if start_epoch > args.epochs:
+        raise ValueError(
+            f"resume checkpoint is already at epoch {start_epoch - 1}, "
+            f"but --epochs={args.epochs}. Increase --epochs to continue training."
+        )
+
+    train_sampler, sampler_metadata = build_source_sampler(
+        dataset, train_set, source_weights, args.steps_per_epoch, args.batch_size
+    )
+    if sampler_metadata:
+        config["sampler"] = sampler_metadata
+        print(f"source sampler: {sampler_metadata}", flush=True)
+    validation_source_indices, validation_source_counts = source_window_subsets(dataset, val_set)
+    if validation_source_counts:
+        config["validation_source_window_counts"] = validation_source_counts
+        print(f"validation source windows: {validation_source_counts}", flush=True)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory and device.type == "cuda",
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory and device.type == "cuda",
+    )
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_yaml(save_dir / "config.yaml", config)
+    normalizer_output = save_dir / "normalizer.pt"
+    if normalizer_source is None:
+        normalizer.save(normalizer_output)
+    else:
+        shutil.copyfile(normalizer_source, normalizer_output)
+        digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest(normalizer_source) != digest(normalizer_output):
+            raise RuntimeError("Frozen normalizer copy hash mismatch")
+        normalizer_provenance = {"source_normalizer_sha256": digest(normalizer_source), "output_normalizer_sha256": digest(normalizer_output)}
+        save_yaml(save_dir / "normalizer_provenance.yaml", normalizer_provenance)
+
+    validation_source_path = save_dir / "validation_by_source.jsonl"
+
+    for epoch in range(start_epoch, args.epochs + 1):
+        train_loss, train_rmse, train_rollout_loss = run_epoch(
+            model,
+            train_loader,
+            normalizer,
+            dataset.state_dim,
+            args.model_type,
+            device,
+            optimizer,
+            scaler,
+            use_amp,
+            args.q_weight,
+            args.dq_weight,
+            q_extra_weights,
+            dq_extra_weights,
+            args.target_mode,
+            args.control_dt,
+            args.loss_type,
+            args.huber_delta,
+            args.rollout_loss_weight,
+            args.rollout_loss_discount,
+            args.micro_batch_size,
+        )
+        val_loss, val_rmse, val_rollout_loss = run_epoch(
+            model,
+            val_loader,
+            normalizer,
+            dataset.state_dim,
+            args.model_type,
+            device,
+            q_weight=args.q_weight,
+            dq_weight=args.dq_weight,
+            q_extra_weights=q_extra_weights,
+            dq_extra_weights=dq_extra_weights,
+            target_mode=args.target_mode,
+            control_dt=args.control_dt,
+            loss_type=args.loss_type,
+            huber_delta=args.huber_delta,
+            rollout_loss_weight=args.rollout_loss_weight,
+            rollout_loss_discount=args.rollout_loss_discount,
+        )
+        per_source_validation: dict[str, dict[str, float | int]] = {}
+        for source_id, source_indices in validation_source_indices.items():
+            source_loader = DataLoader(
+                torch.utils.data.Subset(dataset, source_indices.tolist()), batch_size=args.batch_size, shuffle=False,
+                num_workers=args.num_workers, pin_memory=args.pin_memory and device.type == "cuda",
+            )
+            source_loss, _, source_rollout_loss = run_epoch(
+                model, source_loader, normalizer, dataset.state_dim, args.model_type, device,
+                q_weight=args.q_weight, dq_weight=args.dq_weight, q_extra_weights=q_extra_weights,
+                dq_extra_weights=dq_extra_weights, target_mode=args.target_mode, control_dt=args.control_dt,
+                loss_type=args.loss_type, huber_delta=args.huber_delta, rollout_loss_weight=args.rollout_loss_weight,
+                rollout_loss_discount=args.rollout_loss_discount,
+            )
+            per_source_validation[str(source_id)] = {
+                "loss": source_loss, "rollout_loss": source_rollout_loss, "windows": int(len(source_indices)),
+            }
+        if per_source_validation:
+            with validation_source_path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps({"epoch": epoch, "sources": per_source_validation}, sort_keys=True) + "\n")
+        is_best = val_loss < best_val
+        is_best_rollout = bool(use_rollout_loss and val_rollout_loss < best_rollout)
+        if is_best:
+            best_val = val_loss
+        if is_best_rollout:
+            best_rollout = val_rollout_loss
+        print(format_epoch_header(epoch, train_loss, val_loss, is_best))
+        if use_rollout_loss:
+            print(
+                f"rollout_loss train={train_rollout_loss:.6f} val={val_rollout_loss:.6f} "
+                f"steps={args.rollout_loss_steps} weight={args.rollout_loss_weight:.6f}",
+                flush=True,
+            )
+        print(format_delta_rmse_table(train_rmse, val_rmse, dataset.state_dim // 2))
+        if is_best:
+            save_checkpoint(
+                save_dir / "best_model.pt",
+                model,
+                config,
+                optimizer=optimizer,
+                scaler=scaler,
+                metadata=checkpoint_metadata("best", epoch, train_loss, val_loss, best_val, args, best_rollout),
+            )
+            print(f"  ✓ saved best checkpoint: {save_dir / 'best_model.pt'}")
+        if is_best_rollout:
+            save_checkpoint(
+                save_dir / "best_rollout_model.pt",
+                model,
+                config,
+                optimizer=optimizer,
+                scaler=scaler,
+                metadata=checkpoint_metadata("best_rollout", epoch, train_loss, val_loss, best_val, args, best_rollout),
+            )
+            print(f"  ✓ saved best rollout checkpoint: {save_dir / 'best_rollout_model.pt'}")
+        save_checkpoint(
+            save_dir / "latest_model.pt",
+            model,
+            config,
+            optimizer=optimizer,
+            scaler=scaler,
+            metadata=checkpoint_metadata("latest", epoch, train_loss, val_loss, best_val, args, best_rollout),
+        )
+        write_artifact_manifest(
+            save_dir,
+            robot_identity=robot.artifact_identity(),
+            dataset_manifest_path=manifest_path,
+            dataset_manifest_sha256=dataset_manifest_sha256,
+            plant_identity=plant_identity,
+        )
+        print(f"  → saved latest checkpoint: {save_dir / 'latest_model.pt'}")
+
+
+if __name__ == "__main__":
+    main()

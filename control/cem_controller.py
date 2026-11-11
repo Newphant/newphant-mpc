@@ -1,0 +1,852 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from time import perf_counter
+from typing import Mapping, Protocol
+
+import numpy as np
+import torch
+
+
+class PlannerProtocol(Protocol):
+    def evaluate(self, candidate_action: torch.Tensor) -> dict[str, torch.Tensor]:
+        ...
+
+    def evaluate_exact(self, candidate_action: torch.Tensor) -> dict[str, torch.Tensor]:
+        ...
+
+
+@dataclass(frozen=True)
+class CEMMPCConfig:
+    horizon: int
+    action_dim: int
+    decision_horizon: int | None = None
+    num_samples: int = 1024
+    num_elites: int | None = None
+    elite_ratio: float = 0.08
+    cem_iters: int = 4
+    init_std: float = 0.5
+    min_std: float = 0.05
+    smoothing_alpha: float = 0.2
+    temporal_noise_alpha: float = 0.8
+    reset_std_each_step: bool = True
+    uniform_sample_ratio: float = 0.0
+    force_baseline_candidate: bool = False
+    seed: int = 0
+    device: str = "cpu"
+    execute: str = "lowest_cost"
+    alternative_distance_scale: np.ndarray | None = None
+    selection_validation: str = "none"
+    stage_one_task_mode: str = "off"
+
+
+@dataclass
+class CEMCandidate:
+    """One projected counterfactual plan retained for offline validation."""
+
+    role_mask: tuple[str, ...]
+    q_ref_sequence: np.ndarray
+    residual_sequence: np.ndarray
+    predicted_state_sequence: np.ndarray
+    predicted_cost: float
+    cost_terms: dict[str, float]
+
+
+@dataclass
+class CEMMPCResult:
+    q_ref: np.ndarray
+    delta_q_ref: np.ndarray
+    best_cost: float
+    mean_cost: float
+    baseline_cost: float
+    selected_cost: float
+    elite_mean_cost: float
+    selection_mode: str
+    planning_time: float
+    failure: bool
+    failure_reason: str
+    best_sequence: np.ndarray
+    selected_action_sequence: np.ndarray
+    selected_control_points: np.ndarray
+    selected_q_ref_sequence: np.ndarray
+    selected_residual_sequence: np.ndarray
+    cost_terms: dict[str, float]
+    predicted_next_state: np.ndarray
+    selected_predicted_state_sequence: np.ndarray
+    sampling_std_start_mean: float
+    sampling_std_end_mean: float
+    candidate_count: int = 0
+    valid_candidate_count: int = 0
+    candidate_diagnostics: dict[str, int | float] = field(default_factory=dict)
+    branch_candidates: tuple[CEMCandidate, ...] = ()
+    selected_expected_raw_sequence: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 0), dtype=np.int64)
+    )
+
+
+class CEMMPCController:
+    def __init__(
+        self,
+        config: CEMMPCConfig,
+        planner: PlannerProtocol,
+        joint_low: np.ndarray,
+        joint_high: np.ndarray,
+    ) -> None:
+        if config.horizon <= 0 or config.action_dim <= 0:
+            raise ValueError("horizon and action_dim must be positive")
+        decision_horizon = config.horizon if config.decision_horizon is None else int(config.decision_horizon)
+        if not 0 < decision_horizon <= config.horizon:
+            raise ValueError("decision_horizon must be in [1, horizon]")
+        if decision_horizon < config.horizon and not config.reset_std_each_step:
+            raise ValueError("reduced decision horizons require reset_std_each_step=True")
+        if config.num_samples <= 0 or config.cem_iters <= 0:
+            raise ValueError("num_samples and cem_iters must be positive")
+        if config.execute not in {"mean", "best", "lowest_cost"}:
+            raise ValueError(f"execute must be 'mean', 'best' or 'lowest_cost', got {config.execute!r}")
+        if not 0.0 <= config.uniform_sample_ratio <= 1.0:
+            raise ValueError("uniform_sample_ratio must be in [0, 1]")
+        if config.init_std <= 0.0 or config.min_std <= 0.0:
+            raise ValueError("init_std and min_std must be positive")
+        if config.force_baseline_candidate and config.num_samples < 3:
+            raise ValueError("force_baseline_candidate requires at least three samples")
+        if config.selection_validation not in {"none", "exact_final_pool"}:
+            raise ValueError("selection_validation must be 'none' or 'exact_final_pool'")
+        if config.stage_one_task_mode not in {"off", "gpu_full", "gpu_budgeted"}:
+            raise ValueError("stage_one_task_mode must be 'off', 'gpu_full', or 'gpu_budgeted'")
+        if config.stage_one_task_mode == "gpu_budgeted" and config.cem_iters < 2:
+            raise ValueError("gpu_budgeted requires at least two CEM iterations")
+        self.config = config
+        self.planner = planner
+        self.device = torch.device(config.device)
+        self.generator = torch.Generator(device=self.device).manual_seed(config.seed)
+        self.mean = torch.zeros((decision_horizon, config.action_dim), dtype=torch.float32, device=self.device)
+        self.initial_std = torch.full_like(self.mean, float(config.init_std))
+        self.std = self.initial_std.clone()
+        self.joint_low = torch.as_tensor(joint_low, dtype=torch.float32, device=self.device)
+        self.joint_high = torch.as_tensor(joint_high, dtype=torch.float32, device=self.device)
+        if config.alternative_distance_scale is None:
+            self.alternative_distance_scale = torch.ones(config.action_dim, dtype=torch.float32, device=self.device)
+        else:
+            scale = torch.as_tensor(config.alternative_distance_scale, dtype=torch.float32, device=self.device)
+            if scale.shape != (config.action_dim,) or not bool(torch.all(torch.isfinite(scale))) or bool(torch.any(scale <= 0)):
+                raise ValueError("alternative_distance_scale must contain one finite positive value per action dimension")
+            self.alternative_distance_scale = scale
+
+    @property
+    def decision_horizon(self) -> int:
+        return int(self.mean.shape[0])
+
+    @property
+    def num_elites(self) -> int:
+        if self.config.num_elites is not None:
+            return max(1, min(int(self.config.num_elites), self.config.num_samples))
+        return max(1, min(self.config.num_samples, int(round(self.config.num_samples * self.config.elite_ratio))))
+
+    @property
+    def uniform_sample_count(self) -> int:
+        stochastic_count = self.config.num_samples - (2 if self.config.force_baseline_candidate else 0)
+        return int(round(stochastic_count * float(self.config.uniform_sample_ratio)))
+
+    def _sample_temporal_noise(self, count: int) -> torch.Tensor:
+        noise = torch.randn(
+            (count, self.decision_horizon, self.config.action_dim),
+            generator=self.generator,
+            device=self.device,
+        )
+        alpha = float(self.config.temporal_noise_alpha)
+        if alpha <= 0:
+            return noise
+        for step_idx in range(1, self.decision_horizon):
+            noise[:, step_idx] = alpha * noise[:, step_idx - 1] + (1.0 - alpha) * noise[:, step_idx]
+        return noise
+
+    def _sample_population(self, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+        """Mix local Gaussian candidates with global uniform exploration samples."""
+        forced: list[torch.Tensor] = []
+        stochastic_count = self.config.num_samples
+        if self.config.force_baseline_candidate:
+            forced = [torch.zeros_like(mean).unsqueeze(0), mean.unsqueeze(0)]
+            stochastic_count -= 2
+        uniform_count = int(round(stochastic_count * float(self.config.uniform_sample_ratio)))
+        gaussian_count = stochastic_count - uniform_count
+        samples: list[torch.Tensor] = []
+        if gaussian_count:
+            gaussian = mean.unsqueeze(0) + self._sample_temporal_noise(gaussian_count) * std.unsqueeze(0)
+            samples.append(torch.clamp(gaussian, min=-1.0, max=1.0))
+        if uniform_count:
+            uniform = 2.0 * torch.rand(
+                (uniform_count, self.decision_horizon, self.config.action_dim),
+                generator=self.generator,
+                device=self.device,
+            ) - 1.0
+            samples.append(uniform)
+        return torch.cat([*forced, *samples], dim=0)
+
+    def reset(self) -> None:
+        """Discard a stale warm start after the online safety monitor recovers."""
+        self.mean.zero_()
+        self.std = self.initial_std.clone()
+
+    def advance_after_execution(self, executed_steps: int) -> None:
+        """Advance the CEM warm start after executing a buffered plan prefix.
+
+        ``plan`` without an explicit anchor shift already discards one step;
+        legacy multi-rate callers discard the remaining prefix here.
+        """
+        if executed_steps <= 1:
+            return
+        self.shift_warm_start(int(executed_steps) - 1)
+
+    def shift_warm_start(self, shift_steps: int) -> None:
+        """Align the saved unshifted sequence to a later planning anchor."""
+        if shift_steps <= 0:
+            return
+        self.mean = self._shift_decisions(self.mean, shift_steps)
+
+    def _shifted_warm_start(self, shift_steps: int) -> torch.Tensor:
+        """Return an aligned mean without mutating controller state."""
+        if shift_steps <= 0:
+            return self.mean.clone()
+        return self._shift_decisions(self.mean, shift_steps)
+
+    def _shift_decisions(self, decisions: torch.Tensor, shift_steps: int) -> torch.Tensor:
+        shifter = getattr(self.planner, "shift_control_points", None)
+        if callable(shifter):
+            return shifter(decisions, int(shift_steps)).detach().clone()
+        shift = min(int(shift_steps), decisions.shape[0])
+        tail = decisions[-1:].expand(shift, -1)
+        return torch.cat([decisions[shift:], tail], dim=0).detach().clone()
+
+    def _expand_decisions(self, decisions: torch.Tensor) -> torch.Tensor:
+        expander = getattr(self.planner, "expand_action", None)
+        if callable(expander):
+            return expander(decisions)
+        if decisions.shape != (self.config.horizon, self.config.action_dim):
+            raise RuntimeError("planner must provide expand_action for reduced decision horizons")
+        return decisions
+
+    def _fallback(
+        self,
+        previous_q_ref: np.ndarray,
+        start_time: float,
+        reason: str,
+        candidate_count: int = 0,
+        valid_candidate_count: int = 0,
+        candidate_diagnostics: dict[str, int | float] | None = None,
+    ) -> CEMMPCResult:
+        previous = np.asarray(previous_q_ref, dtype=np.float32)
+        return CEMMPCResult(
+            q_ref=previous.copy(),
+            delta_q_ref=np.zeros(self.config.action_dim, dtype=np.float32),
+            best_cost=float("inf"),
+            mean_cost=float("nan"),
+            baseline_cost=float("nan"),
+            selected_cost=float("inf"),
+            elite_mean_cost=float("inf"),
+            selection_mode="previous_q_ref_fallback",
+            planning_time=perf_counter() - start_time,
+            failure=True,
+            failure_reason=reason,
+            best_sequence=np.zeros((self.decision_horizon, self.config.action_dim), dtype=np.float32),
+            selected_action_sequence=np.zeros((self.config.horizon, self.config.action_dim), dtype=np.float32),
+            selected_control_points=np.zeros((self.decision_horizon, self.config.action_dim), dtype=np.float32),
+            selected_q_ref_sequence=np.repeat(previous[None, :], self.config.horizon, axis=0),
+            selected_residual_sequence=np.zeros((self.config.horizon, self.config.action_dim), dtype=np.float32),
+            cost_terms={},
+            predicted_next_state=np.full(2 * self.config.action_dim, np.nan, dtype=np.float32),
+            selected_predicted_state_sequence=np.full(
+                (self.config.horizon + 1, 2 * self.config.action_dim), np.nan, dtype=np.float32
+            ),
+            sampling_std_start_mean=float("nan"),
+            sampling_std_end_mean=float("nan"),
+            candidate_count=candidate_count,
+            valid_candidate_count=valid_candidate_count,
+            candidate_diagnostics={} if candidate_diagnostics is None else dict(candidate_diagnostics),
+        )
+
+    def _valid_q_ref_sequence(self, sequence: torch.Tensor, batch_size: int) -> bool:
+        expected_shape = (batch_size, self.config.horizon, self.config.action_dim)
+        return sequence.shape == expected_shape and bool(torch.all(torch.isfinite(sequence)))
+
+    def _diagnostics_from_evaluation(
+        self,
+        evaluation: dict[str, torch.Tensor],
+        index: int,
+    ) -> tuple[dict[str, float], np.ndarray]:
+        terms: dict[str, float] = {}
+        for name, values in evaluation.get("cost_terms", {}).items():
+            if isinstance(values, torch.Tensor) and values.ndim == 1 and values.shape[0] > index:
+                terms[name] = float(values[index].detach().cpu())
+        pred_states = evaluation.get("pred_states")
+        if isinstance(pred_states, torch.Tensor) and pred_states.ndim == 3 and pred_states.shape[0] > index and pred_states.shape[1] > 1:
+            predicted_next_state = pred_states[index, 1].detach().cpu().numpy().astype(np.float32)
+        else:
+            predicted_next_state = np.full(2 * self.config.action_dim, np.nan, dtype=np.float32)
+        return terms, predicted_next_state
+
+    def _evaluate_sequence(
+        self, sequence: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float], np.ndarray, torch.Tensor] | None:
+        """Return one constrained action sequence's rollout cost when valid."""
+        try:
+            evaluation = self.planner.evaluate(sequence.unsqueeze(0))
+        except RuntimeError:
+            return None
+        costs = evaluation.get("costs")
+        q_ref_sequences = evaluation.get("q_ref_sequences")
+        if costs is None or q_ref_sequences is None:
+            return None
+        costs = costs.to(self.device)
+        q_ref_sequences = q_ref_sequences.to(self.device)
+        if costs.shape != (1,) or not bool(torch.isfinite(costs[0])):
+            return None
+        if not self._valid_q_ref_sequence(q_ref_sequences, batch_size=1):
+            return None
+        residual_sequences = evaluation.get("residual_sequences", sequence.unsqueeze(0))
+        residual_sequences = residual_sequences.to(self.device)
+        if residual_sequences.shape != q_ref_sequences.shape or not bool(torch.all(torch.isfinite(residual_sequences))):
+            return None
+        terms, predicted_next_state = self._diagnostics_from_evaluation(evaluation, 0)
+        pred_state_sequence = evaluation.get("pred_states")
+        if (
+            not isinstance(pred_state_sequence, torch.Tensor)
+            or pred_state_sequence.shape != (1, self.config.horizon + 1, 2 * self.config.action_dim)
+            or not bool(torch.all(torch.isfinite(pred_state_sequence)))
+        ):
+            return None
+        return costs[0], q_ref_sequences[0], residual_sequences[0], terms, predicted_next_state, pred_state_sequence[0]
+
+    def _exact_final_pool(
+        self,
+        final_samples: torch.Tensor,
+        final_elite_indices: torch.Tensor,
+        best_sequence: torch.Tensor,
+        mean: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], list[set[str]], list[int]]:
+        """Deduplicate, pad, and exactly evaluate final elites/best/mean/baseline."""
+        entries: list[tuple[str, torch.Tensor]] = [
+            *[("elite", final_samples[index]) for index in final_elite_indices],
+            ("best", best_sequence),
+            ("mean", mean),
+            ("baseline", torch.zeros_like(mean)),
+        ]
+        unique: list[torch.Tensor] = []
+        roles: list[set[str]] = []
+        entry_to_unique: list[int] = []
+        for role, sequence in entries:
+            match = next(
+                (
+                    index
+                    for index, existing in enumerate(unique)
+                    if bool(torch.equal(sequence, existing))
+                ),
+                None,
+            )
+            if match is None:
+                match = len(unique)
+                unique.append(sequence)
+                roles.append(set())
+            roles[match].add(role)
+            entry_to_unique.append(match)
+        pool_size = self.num_elites + 3
+        valid_count = len(unique)
+        while len(unique) < pool_size:
+            unique.append(torch.zeros_like(mean))
+            roles.append({"padding"})
+        pool = torch.stack(unique[:pool_size])
+        evaluator = getattr(self.planner, "evaluate_exact", None)
+        if evaluator is None:
+            raise RuntimeError("exact_final_pool requires planner.evaluate_exact")
+        evaluation = evaluator(pool)
+        costs = evaluation["costs"].to(self.device)
+        if costs.shape != (pool_size,):
+            raise RuntimeError("invalid exact final-pool cost shape")
+        mask = torch.arange(pool_size, device=self.device) < valid_count
+        evaluation["costs"] = torch.where(mask, costs, torch.full_like(costs, float("inf")))
+        return pool, evaluation, roles, entry_to_unique
+
+    def plan(
+        self,
+        current_state: np.ndarray,
+        previous_q_ref: np.ndarray,
+        *,
+        warm_start_shift_steps: int | None = None,
+        fixed_candidates: Mapping[str, torch.Tensor] | None = None,
+    ) -> CEMMPCResult:
+        del current_state
+        start_time = perf_counter()
+        asynchronous_anchor = warm_start_shift_steps is not None
+        mean = self._shifted_warm_start(warm_start_shift_steps) if asynchronous_anchor else self.mean.clone()
+        std = self.initial_std.clone() if self.config.reset_std_each_step else self.std.clone()
+        sampling_std_start_mean = float(std.mean().detach().cpu())
+        best_sequence = None
+        best_action_sequence = None
+        best_q_ref_sequence = None
+        best_residual_sequence = None
+        best_cost_terms: dict[str, float] = {}
+        best_predicted_next_state = np.full(2 * self.config.action_dim, np.nan, dtype=np.float32)
+        best_predicted_state_sequence: torch.Tensor | None = None
+        best_cost = torch.as_tensor(float("inf"), device=self.device)
+        elite_mean_cost = torch.as_tensor(float("inf"), device=self.device)
+        final_samples: torch.Tensor | None = None
+        final_evaluation: dict[str, torch.Tensor] | None = None
+        final_elite_indices: torch.Tensor | None = None
+        candidate_count = 0
+        valid_candidate_count = 0
+        candidate_diagnostics: dict[str, int | float] = {}
+        exact_role_evaluations: dict[
+            str,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float], np.ndarray, torch.Tensor],
+        ] = {}
+        fixed_evaluations: dict[
+            str,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float], np.ndarray, torch.Tensor],
+        ] = {}
+
+        try:
+            for iteration_index in range(self.config.cem_iters):
+                use_stage_one_task = (
+                    self.config.stage_one_task_mode == "gpu_full"
+                    or (
+                        self.config.stage_one_task_mode == "gpu_budgeted"
+                        and iteration_index == self.config.cem_iters - 1
+                    )
+                )
+                if self.config.stage_one_task_mode == "gpu_budgeted" and use_stage_one_task:
+                    # The first iteration optimizes base cost only.  Its best is
+                    # not comparable with the final task-aware objective.
+                    best_sequence = None
+                    best_action_sequence = None
+                    best_q_ref_sequence = None
+                    best_residual_sequence = None
+                    best_cost_terms = {}
+                    best_predicted_next_state = np.full(2 * self.config.action_dim, np.nan, dtype=np.float32)
+                    best_predicted_state_sequence = None
+                    best_cost = torch.as_tensor(float("inf"), device=self.device)
+                samples = self._sample_population(mean, std)
+                if use_stage_one_task:
+                    evaluation = self.planner.evaluate(samples, include_stage_one_task_cost=True)
+                elif self.config.stage_one_task_mode == "gpu_budgeted":
+                    evaluation = self.planner.evaluate(samples, include_stage_one_task_cost=False)
+                else:
+                    evaluation = self.planner.evaluate(samples)
+                costs = evaluation["costs"].to(self.device)
+                candidate_count += int(costs.numel())
+                if use_stage_one_task:
+                    candidate_diagnostics["stage_one_task_iteration_index"] = iteration_index
+                    for diagnostic_name in (
+                        "stage_one_task_calls",
+                        "stage_one_task_candidate_count",
+                        "stage_one_task_step_count",
+                        "stage_one_task_pose_count",
+                        "stage_one_task_time_ms",
+                    ):
+                        value = evaluation.get(diagnostic_name)
+                        if isinstance(value, torch.Tensor) and value.numel() == 1:
+                            amount: int | float = (
+                                float(value.detach().cpu())
+                                if diagnostic_name == "stage_one_task_time_ms"
+                                else int(value.detach().cpu())
+                            )
+                            candidate_diagnostics[diagnostic_name] = (
+                                candidate_diagnostics.get(diagnostic_name, 0)
+                                + amount
+                            )
+                for diagnostic_name in (
+                    "requested_residual_valid", "projected_command_valid", "rollout_valid",
+                    "hard_state_constraint_valid", "cost_valid",
+                ):
+                    mask = evaluation.get(diagnostic_name)
+                    if isinstance(mask, torch.Tensor) and mask.numel() == costs.numel():
+                        invalid_count = int(mask.numel() - torch.sum(mask.to(dtype=torch.int64)).detach().cpu())
+                        candidate_diagnostics[f"{diagnostic_name}_invalid_count"] = (
+                            candidate_diagnostics.get(f"{diagnostic_name}_invalid_count", 0) + invalid_count
+                        )
+                if costs.ndim != 1 or costs.shape[0] != self.config.num_samples:
+                    return self._fallback(previous_q_ref, start_time, "invalid_cost_shape", candidate_count, valid_candidate_count, candidate_diagnostics)
+                valid = torch.isfinite(costs)
+                valid_candidate_count += int(torch.sum(valid).detach().cpu())
+                if not bool(torch.any(valid)):
+                    return self._fallback(previous_q_ref, start_time, "all_costs_invalid", candidate_count, valid_candidate_count, candidate_diagnostics)
+                safe_costs = torch.where(valid, costs, torch.full_like(costs, float("inf")))
+                elite_indices = torch.topk(safe_costs, k=self.num_elites, largest=False).indices
+                elites = samples[elite_indices]
+                elite_costs = safe_costs[elite_indices]
+                elite_mean_cost = elite_costs.mean()
+                candidate_best_cost, best_local = torch.min(safe_costs, dim=0)
+                if candidate_best_cost < best_cost:
+                    best_cost = candidate_best_cost
+                    best_sequence = samples[best_local].detach().clone()
+                    if "q_ref_sequences" in evaluation:
+                        best_q_ref_sequence = evaluation["q_ref_sequences"][best_local].detach().clone()
+                    residual_sequences = evaluation.get("residual_sequences")
+                    normalized_sequences = evaluation.get("normalized_residual_sequences")
+                    if isinstance(residual_sequences, torch.Tensor):
+                        best_residual_sequence = residual_sequences[best_local].detach().clone()
+                    elif samples.shape[1] == self.config.horizon:
+                        best_residual_sequence = samples[best_local].detach().clone()
+                    if isinstance(normalized_sequences, torch.Tensor):
+                        best_action_sequence = normalized_sequences[best_local].detach().clone()
+                    elif samples.shape[1] == self.config.horizon:
+                        best_action_sequence = samples[best_local].detach().clone()
+                    best_cost_terms, best_predicted_next_state = self._diagnostics_from_evaluation(evaluation, int(best_local))
+                    best_predicted_state_sequence = evaluation["pred_states"][best_local].detach().clone()
+                new_mean = torch.clamp(elites.mean(dim=0), min=-1.0, max=1.0)
+                new_std = elites.std(dim=0, unbiased=False).clamp_min(float(self.config.min_std))
+                alpha = float(self.config.smoothing_alpha)
+                mean = alpha * mean + (1.0 - alpha) * new_mean
+                std = alpha * std + (1.0 - alpha) * new_std
+                final_samples = samples.detach().clone()
+                final_evaluation = evaluation
+                final_elite_indices = elite_indices.detach().clone()
+        except RuntimeError as exc:
+            return self._fallback(previous_q_ref, start_time, f"planner_runtime_error:{exc}", candidate_count, valid_candidate_count, candidate_diagnostics)
+
+        if (
+            best_sequence is None
+            or best_action_sequence is None
+            or best_q_ref_sequence is None
+            or best_residual_sequence is None
+            or best_predicted_state_sequence is None
+        ):
+            return self._fallback(previous_q_ref, start_time, "no_valid_sequence", candidate_count, valid_candidate_count, candidate_diagnostics)
+        if self.config.selection_validation == "exact_final_pool":
+            if final_samples is None or final_elite_indices is None:
+                return self._fallback(previous_q_ref, start_time, "missing_exact_final_pool", candidate_count, valid_candidate_count, candidate_diagnostics)
+            approximate_best = best_sequence.detach().clone()
+            try:
+                exact_final_pool_start = perf_counter()
+                pool, exact, roles, entry_to_unique = self._exact_final_pool(
+                    final_samples, final_elite_indices, approximate_best, mean
+                )
+                candidate_diagnostics["exact_final_pool_time_s"] = perf_counter() - exact_final_pool_start
+            except RuntimeError as exc:
+                return self._fallback(previous_q_ref, start_time, f"exact_validation_error:{exc}", candidate_count, valid_candidate_count, candidate_diagnostics)
+            exact_costs = exact["costs"].to(self.device)
+            exact_q = exact["q_ref_sequences"].to(self.device)
+            exact_residual = exact.get("residual_sequences", pool).to(self.device)
+            exact_actions = exact.get("normalized_residual_sequences")
+            if not isinstance(exact_actions, torch.Tensor):
+                if pool.shape[1] != self.config.horizon:
+                    return self._fallback(previous_q_ref, start_time, "missing_exact_expanded_actions", candidate_count, valid_candidate_count, candidate_diagnostics)
+                exact_actions = pool
+            exact_actions = exact_actions.to(self.device)
+            exact_predicted = exact["pred_states"].to(self.device)
+            exact_valid = torch.isfinite(exact_costs)
+            exact_count = int(torch.sum(exact_valid).detach().cpu())
+            candidate_count += int(len(exact_costs))
+            valid_candidate_count += exact_count
+            candidate_diagnostics["approx_candidate_count"] = candidate_count - len(exact_costs)
+            candidate_diagnostics["exact_validation_count"] = int(sum("padding" not in role for role in roles))
+            candidate_diagnostics["exact_valid_count"] = exact_count
+            if not bool(torch.any(exact_valid)):
+                return self._fallback(previous_q_ref, start_time, "all_exact_candidates_invalid", candidate_count, valid_candidate_count, candidate_diagnostics)
+
+            def exact_tuple(index: int):
+                terms, predicted_next = self._diagnostics_from_evaluation(exact, index)
+                return (
+                    exact_costs[index],
+                    exact_q[index],
+                    exact_residual[index],
+                    terms,
+                    predicted_next,
+                    exact_predicted[index],
+                )
+
+            role_preference = {"baseline": 0, "mean": 1, "best": 2, "elite": 3}
+            valid_indices = [index for index in range(len(roles)) if bool(exact_valid[index])]
+            selected_index = min(
+                valid_indices,
+                key=lambda index: (
+                    float(exact_costs[index].detach().cpu()),
+                    min(role_preference.get(role, 4) for role in roles[index]),
+                ),
+            )
+            selected_exact = exact_tuple(selected_index)
+            best_cost, best_q_ref_sequence, best_residual_sequence = selected_exact[:3]
+            best_action_sequence = exact_actions[selected_index]
+            best_cost_terms, best_predicted_next_state, best_predicted_state_sequence = selected_exact[3:]
+            best_sequence = pool[selected_index].detach().clone()
+            approximate_best_unique = entry_to_unique[self.num_elites]
+            candidate_diagnostics["exact_selection_changed"] = int(selected_index != approximate_best_unique)
+            approximate_costs = final_evaluation.get("costs")
+            approximate_rank = -1
+            if isinstance(approximate_costs, torch.Tensor):
+                matching = torch.all(
+                    final_samples == pool[selected_index].unsqueeze(0), dim=(1, 2)
+                )
+                if bool(torch.any(matching)):
+                    sample_index = int(torch.nonzero(matching, as_tuple=False)[0, 0])
+                    finite_costs = torch.where(
+                        torch.isfinite(approximate_costs),
+                        approximate_costs,
+                        torch.full_like(approximate_costs, float("inf")),
+                    )
+                    approximate_rank = int(
+                        torch.sum(finite_costs < finite_costs[sample_index]).detach().cpu()
+                    ) + 1
+            candidate_diagnostics["exact_selected_approx_rank"] = approximate_rank
+            for role, entry_index in (
+                ("best", self.num_elites),
+                ("mean", self.num_elites + 1),
+                ("baseline", self.num_elites + 2),
+            ):
+                exact_role_evaluations[role] = exact_tuple(entry_to_unique[entry_index])
+            elite_indices_in_pool = entry_to_unique[: self.num_elites]
+            elite_mean_cost = torch.stack([exact_costs[index] for index in elite_indices_in_pool]).mean()
+            final_evaluation = exact
+            final_samples = pool
+            final_elite_indices = torch.as_tensor(elite_indices_in_pool, device=self.device)
+
+        # Analytical preview/lead branches are deliberately evaluated only
+        # after CEM sampling.  This keeps the learned distribution unchanged
+        # while allowing a physically interpretable candidate to compete with
+        # best/mean/baseline under exactly the same rollout and cost.
+        if fixed_candidates:
+            for name, candidate in fixed_candidates.items():
+                try:
+                    action = torch.as_tensor(candidate, dtype=torch.float32, device=self.device)
+                    if action.shape != (self.decision_horizon, self.config.action_dim):
+                        raise ValueError(f"expected {(self.decision_horizon, self.config.action_dim)}, got {tuple(action.shape)}")
+                    evaluator = getattr(self.planner, "evaluate_exact", None)
+                    evaluation = (evaluator or self.planner.evaluate)(action.unsqueeze(0))
+                    costs = evaluation.get("costs")
+                    q_ref = evaluation.get("q_ref_sequences")
+                    residual = evaluation.get("residual_sequences")
+                    predicted = evaluation.get("pred_states")
+                    if not all(isinstance(value, torch.Tensor) for value in (costs, q_ref, residual, predicted)):
+                        continue
+                    if costs.shape != (1,) or not bool(torch.isfinite(costs[0])):
+                        continue
+                    terms, predicted_next = self._diagnostics_from_evaluation(evaluation, 0)
+                    fixed_evaluations[str(name)] = (
+                        costs[0].to(self.device), q_ref[0].to(self.device), residual[0].to(self.device),
+                        terms, predicted_next, predicted[0].to(self.device),
+                    )
+                except (RuntimeError, ValueError):
+                    continue
+            candidate_count += len(fixed_evaluations)
+            valid_candidate_count += len(fixed_evaluations)
+            candidate_diagnostics["fixed_candidate_count"] = len(fixed_evaluations)
+            for name, item in fixed_evaluations.items():
+                candidate_diagnostics[f"fixed_candidate_{name}_cost"] = float(item[0].detach().cpu())
+        if (
+            not torch.all(torch.isfinite(best_sequence))
+            or not self._valid_q_ref_sequence(best_q_ref_sequence.unsqueeze(0), batch_size=1)
+            or best_action_sequence.shape != (self.config.horizon, self.config.action_dim)
+            or best_residual_sequence.shape != (self.config.horizon, self.config.action_dim)
+            or not bool(torch.all(torch.isfinite(best_residual_sequence)))
+        ):
+            return self._fallback(previous_q_ref, start_time, "invalid_selected_action", candidate_count, valid_candidate_count, candidate_diagnostics)
+
+        mean_cost = float("nan")
+        baseline_cost = float("nan")
+        selected_raw_sequence = best_sequence
+        selected_action_sequence = best_action_sequence
+        selected_q_ref_sequence = best_q_ref_sequence
+        selected_residual_sequence = best_residual_sequence
+        selected_cost = best_cost
+        selection_mode = "best"
+        selected_cost_terms = best_cost_terms
+        selected_predicted_next_state = best_predicted_next_state
+        selected_predicted_state_sequence = best_predicted_state_sequence
+        mean_evaluation = None
+        if self.config.execute in {"mean", "lowest_cost"}:
+            mean_evaluation = exact_role_evaluations.get("mean") or self._evaluate_sequence(mean)
+            if mean_evaluation is not None:
+                mean_cost_tensor, mean_q_ref_sequence, mean_residual_sequence, mean_cost_terms, mean_predicted_next_state, mean_predicted_state_sequence = mean_evaluation
+                mean_cost = float(mean_cost_tensor.detach().cpu())
+                if self.config.execute == "mean":
+                    selected_raw_sequence = mean
+                    selected_action_sequence = self._expand_decisions(mean)
+                    selected_q_ref_sequence = mean_q_ref_sequence
+                    selected_residual_sequence = mean_residual_sequence
+                    selected_cost = mean_cost_tensor
+                    selection_mode = "mean"
+                    selected_cost_terms = mean_cost_terms
+                    selected_predicted_next_state = mean_predicted_next_state
+                    selected_predicted_state_sequence = mean_predicted_state_sequence
+            else:
+                if self.config.execute == "mean":
+                    selection_mode = "best_fallback_invalid_mean"
+
+        baseline_evaluation = None
+        if self.config.force_baseline_candidate:
+            baseline_evaluation = exact_role_evaluations.get("baseline") or self._evaluate_sequence(torch.zeros_like(mean))
+            if baseline_evaluation is not None:
+                baseline_cost = float(baseline_evaluation[0].detach().cpu())
+
+        if self.config.execute == "lowest_cost":
+            candidates: list[tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float], np.ndarray, torch.Tensor]] = [
+                (
+                    "best",
+                    best_sequence,
+                    best_cost,
+                    best_q_ref_sequence,
+                    best_residual_sequence,
+                    best_cost_terms,
+                    best_predicted_next_state,
+                    best_predicted_state_sequence,
+                )
+            ]
+            if mean_evaluation is not None:
+                mean_cost_tensor, mean_q_ref_sequence, mean_residual_sequence, mean_cost_terms, mean_predicted_next_state, mean_predicted_state_sequence = mean_evaluation
+                mean_cost = float(mean_cost_tensor.detach().cpu())
+                candidates.append(
+                    ("mean", mean, mean_cost_tensor, mean_q_ref_sequence, mean_residual_sequence, mean_cost_terms, mean_predicted_next_state, mean_predicted_state_sequence)
+                )
+            if baseline_evaluation is not None:
+                (
+                    baseline_cost_tensor,
+                    baseline_q_ref_sequence,
+                    baseline_residual_sequence,
+                    baseline_cost_terms,
+                    baseline_predicted_next_state,
+                    baseline_predicted_state_sequence,
+                ) = baseline_evaluation
+                candidates.append(
+                    (
+                        "baseline",
+                        torch.zeros_like(mean),
+                        baseline_cost_tensor,
+                        baseline_q_ref_sequence,
+                        baseline_residual_sequence,
+                        baseline_cost_terms,
+                        baseline_predicted_next_state,
+                        baseline_predicted_state_sequence,
+                    )
+                )
+            for name, fixed in fixed_evaluations.items():
+                fixed_cost, fixed_q, fixed_residual, fixed_terms, fixed_next, fixed_predicted = fixed
+                candidates.append(
+                    (
+                        f"fixed:{name}", torch.as_tensor(fixed_candidates[name], device=self.device), fixed_cost,
+                        fixed_q, fixed_residual, fixed_terms, fixed_next, fixed_predicted,
+                    )
+                )
+            # Equal costs should prefer the deterministic baseline, then mean,
+            # over a sampled action.  This makes the direct nominal fallback
+            # stable instead of depending on population ordering.
+            preference = {"baseline": 0, "mean": 1, "best": 2}
+            (
+                selected_name,
+                selected_raw_sequence,
+                selected_cost,
+                selected_q_ref_sequence,
+                selected_residual_sequence,
+                selected_cost_terms,
+                selected_predicted_next_state,
+                selected_predicted_state_sequence,
+            ) = min(
+                candidates, key=lambda item: (float(item[2].detach().cpu()), preference.get(item[0], 3))
+            )
+            selection_mode = selected_name
+            selected_action_sequence = self._expand_decisions(selected_raw_sequence)
+            if selected_name.startswith("fixed:"):
+                candidate_name = selected_name.split(":", 1)[1]
+                fixed_eval = fixed_evaluations.get(candidate_name)
+                if fixed_eval is not None:
+                    selected_predicted_state_sequence = fixed_eval[5]
+
+        selected_expected_raw_sequence = np.empty((0, 0), dtype=np.int64)
+        if final_evaluation is not None:
+            final_q = final_evaluation.get("q_ref_sequences")
+            final_raw = final_evaluation.get("expected_raw_sequences")
+            if isinstance(final_q, torch.Tensor) and isinstance(final_raw, torch.Tensor):
+                matches = torch.all(final_q == selected_q_ref_sequence.unsqueeze(0), dim=(1, 2))
+                if bool(torch.any(matches)):
+                    selected_index = int(torch.nonzero(matches, as_tuple=False)[0, 0])
+                    selected_expected_raw_sequence = (
+                        final_raw[selected_index].detach().cpu().numpy().astype(np.int64)
+                    )
+
+        saved_mean = (
+            selected_raw_sequence
+            if asynchronous_anchor
+            else self._shift_decisions(selected_raw_sequence, 1)
+        )
+        self.mean = torch.clamp(saved_mean, min=-1.0, max=1.0).detach().clone()
+        sampling_std_end_mean = float(std.mean().detach().cpu())
+        self.std = self.initial_std.clone() if self.config.reset_std_each_step else std.detach().clone()
+        selected_q_ref = selected_q_ref_sequence[0].detach().cpu().numpy().astype(np.float32)
+        previous = np.asarray(previous_q_ref, dtype=np.float32)
+        selected_delta = (selected_q_ref - previous).astype(np.float32)
+        candidate_specs: list[tuple[tuple[str, ...], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, float]]] = [
+            (
+                ("selected",),
+                selected_q_ref_sequence,
+                selected_residual_sequence,
+                selected_predicted_state_sequence,
+                selected_cost,
+                selected_cost_terms,
+            )
+        ]
+        if baseline_evaluation is not None:
+            baseline_cost_tensor, baseline_q_ref, baseline_residual, baseline_terms, _, baseline_predicted = baseline_evaluation
+            duplicate = torch.allclose(baseline_q_ref, selected_q_ref_sequence, atol=1e-6, rtol=0.0)
+            if duplicate:
+                candidate_specs[0] = (
+                    ("selected", "baseline"), selected_q_ref_sequence, selected_residual_sequence,
+                    selected_predicted_state_sequence, selected_cost, selected_cost_terms,
+                )
+            else:
+                candidate_specs.append((("baseline",), baseline_q_ref, baseline_residual, baseline_predicted, baseline_cost_tensor, baseline_terms))
+
+        if final_samples is not None and final_evaluation is not None and final_elite_indices is not None:
+            final_q = final_evaluation.get("q_ref_sequences")
+            final_residual = final_evaluation.get("residual_sequences")
+            final_predicted = final_evaluation.get("pred_states")
+            final_costs = final_evaluation.get("costs")
+            if all(isinstance(value, torch.Tensor) for value in (final_q, final_residual, final_predicted, final_costs)):
+                distances = torch.sqrt(torch.mean(torch.square((final_q[final_elite_indices] - selected_q_ref_sequence) / self.alternative_distance_scale), dim=(1, 2)))
+                valid_distinct = distances > 1e-6
+                if bool(torch.any(valid_distinct)):
+                    masked = torch.where(valid_distinct, distances, torch.full_like(distances, -1.0))
+                    alternative_index = final_elite_indices[torch.argmax(masked)]
+                    alternative_q = final_q[alternative_index]
+                    if not any(torch.allclose(alternative_q, spec[1], atol=1e-6, rtol=0.0) for spec in candidate_specs):
+                        alternative_terms, _ = self._diagnostics_from_evaluation(final_evaluation, int(alternative_index))
+                        candidate_specs.append((
+                            ("alternative_elite",), alternative_q, final_residual[alternative_index],
+                            final_predicted[alternative_index], final_costs[alternative_index], alternative_terms,
+                        ))
+
+        branch_candidates = tuple(
+            CEMCandidate(
+                role_mask=roles,
+                q_ref_sequence=q_ref.detach().cpu().numpy().astype(np.float32),
+                residual_sequence=residual.detach().cpu().numpy().astype(np.float32),
+                predicted_state_sequence=predicted.detach().cpu().numpy().astype(np.float32),
+                predicted_cost=float(cost.detach().cpu()),
+                cost_terms=terms,
+            )
+            for roles, q_ref, residual, predicted, cost, terms in candidate_specs
+        )
+        return CEMMPCResult(
+            q_ref=selected_q_ref,
+            delta_q_ref=selected_delta,
+            best_cost=float(best_cost.detach().cpu()),
+            mean_cost=mean_cost,
+            baseline_cost=baseline_cost,
+            selected_cost=float(selected_cost.detach().cpu()),
+            elite_mean_cost=float(elite_mean_cost.detach().cpu()),
+            selection_mode=selection_mode,
+            planning_time=perf_counter() - start_time,
+            failure=False,
+            failure_reason="",
+            best_sequence=best_sequence.detach().cpu().numpy().astype(np.float32),
+            selected_action_sequence=selected_action_sequence.detach().cpu().numpy().astype(np.float32),
+            selected_control_points=selected_raw_sequence.detach().cpu().numpy().astype(np.float32),
+            selected_q_ref_sequence=selected_q_ref_sequence.detach().cpu().numpy().astype(np.float32),
+            selected_residual_sequence=selected_residual_sequence.detach().cpu().numpy().astype(np.float32),
+            cost_terms=selected_cost_terms,
+            predicted_next_state=selected_predicted_next_state,
+            selected_predicted_state_sequence=selected_predicted_state_sequence.detach().cpu().numpy().astype(np.float32),
+            sampling_std_start_mean=sampling_std_start_mean,
+            sampling_std_end_mean=sampling_std_end_mean,
+            candidate_count=candidate_count,
+            valid_candidate_count=valid_candidate_count,
+            candidate_diagnostics=candidate_diagnostics,
+            branch_candidates=branch_candidates,
+            selected_expected_raw_sequence=selected_expected_raw_sequence,
+        )
